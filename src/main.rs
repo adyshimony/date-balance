@@ -204,6 +204,7 @@ struct BalanceResponse {
     usd: f64,
     firsttx: Option<String>,
     lasttx: Option<String>,
+    lasttx_to_date: Option<String>,
 }
 
 /// Main entry point of the program
@@ -263,6 +264,27 @@ fn main() -> Result<(), BalanceError> {
             lasttx = Some(tx);
         }
     }
+
+    // Find the most recent transaction up to today
+    let current_timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|e| BalanceError::ParsingError(e.to_string()))?
+        .as_secs();
+    
+    let mut latest_time = 0;
+    let mut lasttx_to_date = None;
+    
+    for (txid, height) in &history {
+        match checker.get_block_timestamp(*height as usize) {
+            Ok(block_time) => {
+                if block_time <= current_timestamp && block_time >= latest_time {
+                    latest_time = block_time;
+                    lasttx_to_date = Some(txid.to_string());
+                }
+            },
+            Err(_) => continue
+        }
+    }
     
     // Create response
     let response = BalanceResponse {
@@ -271,6 +293,7 @@ fn main() -> Result<(), BalanceError> {
         usd: 0.0, // Placeholder for USD value
         firsttx,
         lasttx,
+        lasttx_to_date,
     };
 
     // Print JSON response
