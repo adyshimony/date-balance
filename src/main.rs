@@ -25,8 +25,9 @@ use electrum_client::{Client, ElectrumApi};
 use electrum_client::bitcoin::{Txid, Network, Address, Script};
 use electrum_client::bitcoin::consensus::Decodable;
 use std::str::FromStr;
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 use serde_json;
+use tiny_http::{Server, Response, StatusCode};
 
 /// Custom error type for handling various failure scenarios in the program
 #[derive(Debug)]
@@ -128,11 +129,13 @@ impl BalanceChecker {
 
     /// Checks the balance of a Bitcoin address at a specific timestamp
     fn check_balance(&self, address: &str, timestamp: u64) -> Result<f64, BalanceError> {
-        let script = Address::from_str(address)
-            .map_err(|e| BalanceError::InvalidAddress(e.to_string()))?
-            .require_network(self.connector.config.network)
-            .map_err(|e| BalanceError::InvalidAddress(e.to_string()))?
-            .script_pubkey();
+        // Parse address and get script
+        let addr = Address::from_str(address)?;
+        
+        // Convert to the right network and get script pubkey
+        let addr = addr.require_network(self.connector.config.network)
+            .map_err(|_| BalanceError::InvalidAddress("Invalid network".to_string()))?;
+        let script = addr.script_pubkey();
 
         let day_end = timestamp + 24 * 60 * 60 - 1;
 
@@ -181,12 +184,92 @@ impl BalanceChecker {
     }
 
     /// Gets transaction history for an address
-    fn get_transaction_history(&self, script: &Script) -> Result<Vec<(Txid, u64)>, BalanceError> {
-        let history = self.connector.client.script_get_history(script)?;
+    fn get_transaction_history(&self, address: &str) -> Result<Vec<(Txid, u64)>, BalanceError> {
+        // Parse address and get script
+        let addr = Address::from_str(address)?;
+        
+        // Convert to the right network and get script pubkey
+        let addr = addr.require_network(self.connector.config.network)
+            .map_err(|_| BalanceError::InvalidAddress("Invalid network".to_string()))?;
+        let script = addr.script_pubkey();
+        
+        let history = self.connector.client.script_get_history(&script)?;
         Ok(history.into_iter()
             .filter(|tx| tx.height > 0)
             .map(|tx| (tx.tx_hash, tx.height as u64))
             .collect())
+    }
+    
+    /// Gets the full balance information for an address at a specific timestamp
+    fn get_balance_info(&self, address: &str, timestamp: u64) -> Result<BalanceResponse, BalanceError> {
+        // Get transaction history
+        let history = self.get_transaction_history(address)?;
+        let totaltx = history.len() as u64;
+
+        // Calculate balance
+        let balance = self.check_balance(address, timestamp)?;
+
+        // Find first transaction
+        let firsttx = history.iter()
+            .min_by_key(|(_, height)| height)
+            .map(|(txid, _)| txid.to_string());
+
+        // Initialize lasttx to be the same as firsttx as a fallback
+        let mut lasttx = firsttx.clone();
+        
+        // Try to find the actual last transaction before the target timestamp
+        if !history.is_empty() {
+            let mut latest_time = 0;
+            let mut latest_tx = None;
+            
+            for (txid, height) in &history {
+                match self.get_block_timestamp(*height as usize) {
+                    Ok(block_time) => {
+                        if block_time <= timestamp && block_time >= latest_time {
+                            latest_time = block_time;
+                            latest_tx = Some(txid.to_string());
+                        }
+                    },
+                    Err(_) => continue
+                }
+            }
+            
+            // Only update lasttx if we found a valid transaction
+            if let Some(tx) = latest_tx {
+                lasttx = Some(tx);
+            }
+        }
+
+        // Find the most recent transaction up to today
+        let current_timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        let mut latest_time = 0;
+        let mut lasttx_to_date = None;
+        
+        for (txid, height) in &history {
+            match self.get_block_timestamp(*height as usize) {
+                Ok(block_time) => {
+                    if block_time <= current_timestamp && block_time >= latest_time {
+                        latest_time = block_time;
+                        lasttx_to_date = Some(txid.to_string());
+                    }
+                },
+                Err(_) => continue
+            }
+        }
+        
+        // Create response
+        Ok(BalanceResponse {
+            balance,
+            totaltx,
+            usd: 0.0, // Placeholder for USD value
+            firsttx,
+            lasttx,
+            lasttx_to_date,
+        })
     }
 }
 
@@ -197,7 +280,7 @@ fn date_to_timestamp(date_str: &str) -> Result<u64, BalanceError> {
     Ok(DateTime::<Utc>::from_naive_utc_and_offset(naive_datetime, Utc).timestamp() as u64)
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct BalanceResponse {
     balance: f64,
     totaltx: u64,
@@ -207,98 +290,137 @@ struct BalanceResponse {
     lasttx_to_date: Option<String>,
 }
 
-/// Main entry point of the program
-fn main() -> Result<(), BalanceError> {
-    let config = Config::default();
+// API request struct
+#[derive(Deserialize)]
+struct ApiRequest {
+    address: String,
+    date: String,
+}
+
+// Start the HTTP API server
+fn start_api_server(config: Config) -> Result<(), BalanceError> {
     let connector = ElectrumConnector::new(&config)?;
     let checker = BalanceChecker::new(connector);
-
-    //let address = "bc1qv0gtzvsjh5tpmeehyp90dn6k8w6ddlfdtqej9c";
-    let address = "1BBZggkhPgb9Jy4f1fq2itQUKVYq9mMufY";
-    let date = "2021-01-07 00:00:00";
-
-    let start = SystemTime::now();
-    let timestamp = date_to_timestamp(date)?;
     
-    // Get the script pubkey for the address
-    let script = Address::from_str(address)
-        .map_err(|e| BalanceError::InvalidAddress(e.to_string()))?
-        .require_network(config.network)
-        .map_err(|e| BalanceError::InvalidAddress(e.to_string()))?
-        .script_pubkey();
+    let server = Server::http("127.0.0.1:3030").map_err(|e| BalanceError::ConnectionError(format!("Failed to start server: {}", e)))?;
+    println!("API server running at http://127.0.0.1:3030");
+    println!("Press Ctrl-C to stop the server");
 
-    // Get transaction history
-    let history = checker.get_transaction_history(&script)?;
-    let totaltx = history.len() as u64;
-
-    // Calculate balance
-    let balance = checker.check_balance(address, timestamp)?;
-
-    // Find first transaction
-    let firsttx = history.iter()
-        .min_by_key(|(_, height)| height)
-        .map(|(txid, _)| txid.to_string());
-
-    // Initialize lasttx to be the same as firsttx as a fallback
-    let mut lasttx = firsttx.clone();
-    
-    // Try to find the actual last transaction before the target timestamp
-    if !history.is_empty() {
-        let mut latest_time = 0;
-        let mut latest_tx = None;
+    for mut request in server.incoming_requests() {
+        // Extract query parameters
+        let url = request.url();
         
-        for (txid, height) in &history {
-            match checker.get_block_timestamp(*height as usize) {
-                Ok(block_time) => {
-                    if block_time <= timestamp && block_time >= latest_time {
-                        latest_time = block_time;
-                        latest_tx = Some(txid.to_string());
-                    }
-                },
-                Err(_) => continue
+        // Simple solution: Expect url in the format "/balance?address=<address>&date=<date>"
+        if !url.starts_with("/balance") {
+            let response = Response::from_string("Only /balance endpoint is supported")
+                .with_status_code(StatusCode(404));
+            let _ = request.respond(response);
+            continue;
+        }
+        
+        // Parse query parameters
+        let parts: Vec<&str> = url.split('?').collect();
+        if parts.len() != 2 {
+            let response = Response::from_string("Invalid query parameters")
+                .with_status_code(StatusCode(400));
+            let _ = request.respond(response);
+            continue;
+        }
+        
+        let query = parts[1];
+        let mut address = None;
+        let mut date = None;
+        
+        for param in query.split('&') {
+            let kv: Vec<&str> = param.split('=').collect();
+            if kv.len() != 2 {
+                continue;
+            }
+            
+            match kv[0] {
+                "address" => address = Some(kv[1].to_string()),
+                "date" => date = Some(kv[1].to_string().replace("%20", " ")),
+                _ => {}
             }
         }
         
-        // Only update lasttx if we found a valid transaction
-        if let Some(tx) = latest_tx {
-            lasttx = Some(tx);
+        if address.is_none() || date.is_none() {
+            let response = Response::from_string("Missing required parameters: address, date")
+                .with_status_code(StatusCode(400));
+            let _ = request.respond(response);
+            continue;
         }
-    }
+        
+        let address = address.unwrap();
+        let date = date.unwrap();
+        
+        // Convert date to timestamp
+        let timestamp = match date_to_timestamp(&date) {
+            Ok(ts) => ts,
+            Err(e) => {
+                let response = Response::from_string(format!("Invalid date format: {}", e))
+                    .with_status_code(StatusCode(400));
+                let _ = request.respond(response);
+                continue;
+            }
+        };
 
-    // Find the most recent transaction up to today
-    let current_timestamp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|e| BalanceError::ParsingError(e.to_string()))?
-        .as_secs();
-    
-    let mut latest_time = 0;
-    let mut lasttx_to_date = None;
-    
-    for (txid, height) in &history {
-        match checker.get_block_timestamp(*height as usize) {
-            Ok(block_time) => {
-                if block_time <= current_timestamp && block_time >= latest_time {
-                    latest_time = block_time;
-                    lasttx_to_date = Some(txid.to_string());
+        // Get full balance information
+        match checker.get_balance_info(&address, timestamp) {
+            Ok(response_data) => {
+                // Convert to JSON and respond
+                match serde_json::to_string(&response_data) {
+                    Ok(json) => {
+                        let response = Response::from_string(json)
+                            .with_header(tiny_http::Header {
+                                field: "Content-Type".parse().unwrap(),
+                                value: "application/json".parse().unwrap(),
+                            })
+                            .with_status_code(StatusCode(200));
+                        let _ = request.respond(response);
+                    },
+                    Err(e) => {
+                        let response = Response::from_string(format!("Error serializing response: {}", e))
+                            .with_status_code(StatusCode(500));
+                        let _ = request.respond(response);
+                    }
                 }
             },
-            Err(_) => continue
+            Err(e) => {
+                let response = Response::from_string(format!("Error processing request: {}", e))
+                    .with_status_code(StatusCode(500));
+                let _ = request.respond(response);
+            }
         }
     }
+
+    Ok(())
+}
+
+/// Main entry point of the program
+fn main() -> Result<(), BalanceError> {
+    let config = Config::default();
     
-    // Create response
-    let response = BalanceResponse {
-        balance,
-        totaltx,
-        usd: 0.0, // Placeholder for USD value
-        firsttx,
-        lasttx,
-        lasttx_to_date,
-    };
+    // Start the API server if requested
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "--server" {
+        return start_api_server(config);
+    }
+    
+    // Otherwise run in CLI mode
+    let connector = ElectrumConnector::new(&config)?;
+    let checker = BalanceChecker::new(connector);
+
+    let address = "1BBZggkhPgb9Jy4f1fq2itQUKVYq9mMufY";
+    let date = "2021-01-07 00:00:00";
+
+    let timestamp = date_to_timestamp(date)?;
+    
+    // Get full balance info
+    let response = checker.get_balance_info(address, timestamp)?;
 
     // Print JSON response
-    let json = serde_json::to_string_pretty(&response)
-        .map_err(|e| BalanceError::ParsingError(e.to_string()))?;
+    let json = serde_json::to_string_pretty(&response)?;
     println!("{}", json);
 
     Ok(())
